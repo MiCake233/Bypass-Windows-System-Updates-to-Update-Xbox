@@ -1,6 +1,6 @@
 * text=auto eol=lf
 
-*.cmd text eol=crlf
-*.bat text eol=crlf
-*.ps1 text eol=crlf
-*.psm1 text eol=crlf
+# Batch files are stored byte for byte: cmd.exe is sensitive to line endings, and a checkout or a
+# raw download must produce CRLF regardless of the platform doing the checkout.
+*.cmd -text
+*.bat -text
