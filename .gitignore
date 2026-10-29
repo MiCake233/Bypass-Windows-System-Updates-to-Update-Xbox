@@ -1,0 +1,7 @@
+*.log
+xbox-offline-diagnostics.txt
+packages/
+.packages/
+*.partial
+.DS_Store
+Thumbs.db
