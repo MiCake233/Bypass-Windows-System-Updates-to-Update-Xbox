@@ -25,7 +25,7 @@
 | `0x80073CF0` | archive invalid or incomplete | delete the cached file under `%LOCALAPPDATA%\XboxOfflineUpdate\packages` and re-run |
 | `0x80073CF6` | package could not be registered | check the deployment log; a damaged prior registration may need removal |
 | `0x80073CF9` | deployment rejected by `AppXSvc` | reboot, then re-run |
-| `0x80073CFB` | package already installed at this or a higher version | nothing to do |
+| `0x80073CFB` | package already installed; reinstall blocked | nothing to do when that version is already present |
 | `0x80073D02` | package in use, or another deployment running | close the applications using it |
 | `0x80073D05` | package file held open by a process | close all Xbox related processes |
 | `0x80070005` | access denied | elevate the session |

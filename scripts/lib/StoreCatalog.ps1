@@ -64,7 +64,8 @@ function Select-CatalogPackage {
         [object[]]$Listing,
         [Parameter(Mandatory = $true)][string]$Identity,
         [string[]]$Architecture = @('neutral', 'x64', 'arm64'),
-        [string[]]$Extension = @('appxbundle', 'msixbundle')
+        [string[]]$Extension = @('appxbundle', 'msixbundle'),
+        [string]$MinimumVersion
     )
 
     $best = $null
@@ -74,6 +75,9 @@ function Select-CatalogPackage {
         if ($parsed.Identity -ne $Identity) { continue }
         if ($Extension -notcontains $parsed.Extension) { continue }
         if ($Architecture -notcontains $parsed.Architecture) { continue }
+        if (-not [string]::IsNullOrWhiteSpace($MinimumVersion)) {
+            if ((Compare-PackageVersion -Left $parsed.Version -Right $MinimumVersion) -lt 0) { continue }
+        }
 
         $url = Resolve-SafeDownloadUrl -Url $item.Url
         if (-not $url) {
@@ -101,14 +105,38 @@ function Select-CatalogPackage {
     return $best
 }
 
+function Resolve-DependencyPackage {
+    param(
+        [string]$ProductId,
+        [object[]]$Listing,
+        [Parameter(Mandatory = $true)][string]$DependencyIdentity,
+        [string]$MinimumVersion
+    )
+    if ($null -eq $Listing) {
+        $Listing = Get-StoreCatalogListing -ProductId $ProductId
+    }
+    $architectures = @(Get-HostArchitecture)
+    if ($architectures -notcontains 'neutral') { $architectures += 'neutral' }
+    $target = Select-CatalogPackage -Listing $Listing -Identity $DependencyIdentity -Architecture $architectures -Extension @('appx', 'msix') -MinimumVersion $MinimumVersion
+    if ($null -eq $target) {
+        $requirement = $DependencyIdentity
+        if (-not [string]::IsNullOrWhiteSpace($MinimumVersion)) { $requirement = $requirement + ' at or above ' + $MinimumVersion }
+        throw ('The catalog has no deployable payload for the required framework ' + $requirement + '.')
+    }
+    return $target
+}
+
 function Get-CurrentPackageTarget {
     param(
         [Parameter(Mandatory = $true)][string]$ProductId,
         [Parameter(Mandatory = $true)][string]$Identity,
-        [string[]]$Architecture = @('neutral', 'x64', 'arm64'),
+        [string[]]$Architecture,
         [string[]]$Extension = @('appxbundle', 'msixbundle')
     )
 
+    if ($null -eq $Architecture -or $Architecture.Count -eq 0) {
+        $Architecture = Get-CompatibleArchitectures
+    }
     $listing = Get-StoreCatalogListing -ProductId $ProductId
     $target = Select-CatalogPackage -Listing $listing -Identity $Identity -Architecture $Architecture -Extension $Extension
     if ($null -eq $target) {
@@ -118,4 +146,88 @@ function Get-CurrentPackageTarget {
         Target  = $target
         Listing = $listing
     }
+}
+
+function Get-TargetFromUrl {
+    param([Parameter(Mandatory = $true)][string]$Url)
+    $safe = Resolve-SafeDownloadUrl -Url $Url
+    if (-not $safe) { throw 'The supplied URL is not an https URL on a Microsoft delivery host.' }
+    $fileName = [IO.Path]::GetFileName(([Uri]$safe).AbsolutePath)
+    $parsed = $null
+    if (-not [string]::IsNullOrWhiteSpace($fileName)) {
+        $parsed = ConvertFrom-StoreFileName -FileName $fileName
+    }
+    # Real delivery URLs end in a file id, not the package name. The manifest
+    # supplies identity and version after the download.
+    if ($null -eq $parsed) {
+        return [pscustomobject]@{
+            Identity     = $null
+            Version      = $null
+            Architecture = $null
+            Extension    = $null
+            FileName     = (Get-DirectDownloadFileName -Url $safe)
+            Url          = $safe
+            LocalPath    = $null
+        }
+    }
+    return [pscustomobject]@{
+        Identity     = $parsed.Identity
+        Version      = $parsed.Version
+        Architecture = $parsed.Architecture
+        Extension    = $parsed.Extension
+        FileName     = $fileName
+        Url          = $safe
+        LocalPath    = $null
+    }
+}
+
+function Save-PackageFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [int]$MaxAttempts = 3
+    )
+    $partial = $Destination + '.partial'
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $redirectRejected = $false
+        try {
+            if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue }
+            $saved = $ProgressPreference
+            $ProgressPreference = 'SilentlyContinue'
+            try {
+                $params = @{
+                    Uri             = $Url
+                    OutFile         = $partial
+                    UseBasicParsing = $true
+                    TimeoutSec      = 1800
+                }
+                $webCommand = Get-Command -Name Invoke-WebRequest
+                if ($webCommand.Parameters.ContainsKey('PassThru')) { $params.PassThru = $true }
+                $response = Invoke-WebRequest @params
+            } finally {
+                $ProgressPreference = $saved
+            }
+            $finalUri = Get-WebResponseFinalUri -Response $response
+            if (-not (Test-AllowedDeliveryUri -Url $finalUri)) {
+                $redirectRejected = $true
+                throw 'The download was redirected away from the allowed Microsoft delivery hosts.'
+            }
+            $payloadError = Test-ZipPackageFile -Path $partial
+            if ($payloadError) { throw $payloadError }
+            $length = (Get-Item -LiteralPath $partial).Length
+            Move-Item -LiteralPath $partial -Destination $Destination -Force
+            Write-Log -Message ('Downloaded ' + (Split-Path -Leaf $Destination) + ' (' + [math]::Round($length / 1MB, 1) + ' MB)') -Level OK
+            return $true
+        } catch {
+            if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue }
+            $safeError = Get-RedactedLogText -Message $_.Exception.Message -Url $Url
+            if ($redirectRejected) {
+                Write-Log -Message ('Download rejected: ' + $safeError) -Level ERROR
+                throw $safeError
+            }
+            Write-Log -Message ('Download attempt ' + $attempt + '/' + $MaxAttempts + ' failed: ' + $safeError) -Level WARN
+            if ($attempt -lt $MaxAttempts) { Start-Sleep -Seconds (3 * $attempt) }
+        }
+    }
+    return $false
 }
