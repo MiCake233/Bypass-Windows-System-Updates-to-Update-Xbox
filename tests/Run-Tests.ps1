@@ -138,6 +138,220 @@ Assert-Equal 'localised dependency version' '2.1.1.0' $localisedDependency.MinVe
 Write-Result -Name 'unknown hresult has guidance' -Condition (-not [string]::IsNullOrEmpty((Get-DeploymentGuidance -Code '0xDEADBEEF')))
 
 Write-Host ''
+Write-Host 'download policy'
+
+$fileScheme = Resolve-SafeDownloadUrl -Url 'file://tlu.dl.delivery.mp.microsoft.com/pkg.appxbundle'
+Write-Result -Name 'file scheme is rejected' -Condition ($null -eq $fileScheme)
+
+$userInfo = Resolve-SafeDownloadUrl -Url 'https://user:pass@tlu.dl.delivery.mp.microsoft.com/pkg.appxbundle'
+Write-Result -Name 'userinfo is rejected' -Condition ($null -eq $userInfo)
+
+$finalHttps = Test-AllowedDeliveryUri -Url 'https://tlu.dl.delivery.mp.microsoft.com/filestreamingservice/files/abc'
+Write-Result -Name 'final https delivery uri is allowed' -Condition ($finalHttps)
+$finalHttp = Test-AllowedDeliveryUri -Url 'http://tlu.dl.delivery.mp.microsoft.com/filestreamingservice/files/abc'
+Write-Result -Name 'final http uri is rejected' -Condition (-not $finalHttp)
+$finalForeign = Test-AllowedDeliveryUri -Url 'https://evil.example/pkg.appxbundle'
+Write-Result -Name 'final foreign uri is rejected' -Condition (-not $finalForeign)
+
+$redacted = Get-RedactedUrl -Url 'https://user:pass@tlu.dl.delivery.mp.microsoft.com/filestreamingservice/files/abc?P1=1&P4=secret-token'
+Write-Result -Name 'redacted url drops the query' -Condition ($redacted -notlike '*secret-token*' -and $redacted -notlike '*P4=*')
+Write-Result -Name 'redacted url drops userinfo' -Condition ($redacted -notlike '*pass*')
+$redactedLog = Get-RedactedLogText -Message 'failed https://tlu.dl.delivery.mp.microsoft.com/files/abc?P4=secret-token' -Url 'https://tlu.dl.delivery.mp.microsoft.com/files/abc?P4=secret-token'
+Write-Result -Name 'log text drops signed query' -Condition ($redactedLog -notlike '*secret-token*')
+
+$guidUrl = 'http://tlu.dl.delivery.mp.microsoft.com/filestreamingservice/files/ad8ac804-8729-4079-baba-289992b47f64?P1=1&amp;P2=404'
+$directTarget = Get-TargetFromUrl -Url $guidUrl
+Assert-Equal 'delivery url is upgraded' $true ($directTarget.Url.StartsWith('https://'))
+Write-Result -Name 'guid delivery url has no advertised version' -Condition ([string]::IsNullOrEmpty($directTarget.Version))
+Write-Result -Name 'guid delivery url uses a safe cache name' -Condition ($directTarget.FileName -match '^direct-[0-9a-f]{32}\.pkg$')
+$namedUrl = 'https://tlu.dl.delivery.mp.microsoft.com/Microsoft.GamingServices_39.118.21002.0_neutral_~_8wekyb3d8bbwe.appxbundle'
+$namedTarget = Get-TargetFromUrl -Url $namedUrl
+Assert-Equal 'named url keeps the advertised version' '39.118.21002.0' $namedTarget.Version
+
+$savedArchitecture = $env:PROCESSOR_ARCHITECTURE
+$savedWow = $env:PROCESSOR_ARCHITEW6432
+try {
+    $env:PROCESSOR_ARCHITECTURE = 'ARM64'
+    Remove-Item Env:PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
+    Assert-Equal 'native arm64 host' 'arm64' (Get-HostArchitecture)
+    $env:PROCESSOR_ARCHITECTURE = 'x86'
+    $env:PROCESSOR_ARCHITEW6432 = 'ARM64'
+    Assert-Equal 'wow64 arm64 host' 'arm64' (Get-HostArchitecture)
+    $env:PROCESSOR_ARCHITECTURE = 'AMD64'
+    Remove-Item Env:PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
+    Assert-Equal 'amd64 host' 'x64' (Get-HostArchitecture)
+} finally {
+    $env:PROCESSOR_ARCHITECTURE = $savedArchitecture
+    if ([string]::IsNullOrEmpty($savedWow)) {
+        Remove-Item Env:PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
+    } else {
+        $env:PROCESSOR_ARCHITEW6432 = $savedWow
+    }
+}
+
+Write-Host ''
+Write-Host 'version policy and architecture selection'
+
+$match = Test-PackageVersionPolicy -ManifestVersion '39.118.21002.0' -AdvertisedVersion '39.118.21002.0' -InstalledVersion '34.111.20001.0' -ManifestArchitecture '' -AdvertisedArchitecture 'neutral' -HostArchitecture 'x64'
+Write-Result -Name 'newer matching manifest is accepted' -Condition $match.Passed
+
+$downgrade = Test-PackageVersionPolicy -ManifestVersion '34.111.20001.0' -AdvertisedVersion '39.118.21002.0' -InstalledVersion '34.111.20001.0'
+Write-Result -Name 'spoofed file name is rejected' -Condition (-not $downgrade.Passed)
+
+$notNewer = Test-PackageVersionPolicy -ManifestVersion '34.111.20001.0' -AdvertisedVersion '34.111.20001.0' -InstalledVersion '39.118.21002.0'
+Write-Result -Name 'older manifest is rejected' -Condition (-not $notNewer.Passed)
+
+$forced = Test-PackageVersionPolicy -ManifestVersion '34.111.20001.0' -AdvertisedVersion '34.111.20001.0' -InstalledVersion '39.118.21002.0' -Force
+Write-Result -Name 'force allows an older matching manifest' -Condition $forced.Passed
+
+$belowMin = Test-PackageVersionPolicy -ManifestVersion '2.1.0.0' -AdvertisedVersion '2.1.0.0' -MinimumVersion '2.6.4.0'
+Write-Result -Name 'framework below minimum is rejected' -Condition (-not $belowMin.Passed)
+
+$wrongArch = Test-PackageVersionPolicy -ManifestVersion '14.0.33519.0' -AdvertisedVersion '14.0.33519.0' -ManifestArchitecture 'x64' -AdvertisedArchitecture 'x64' -HostArchitecture 'arm64'
+Write-Result -Name 'wrong architecture is rejected' -Condition (-not $wrongArch.Passed)
+
+$archListing = @(
+    [pscustomobject]@{ FileName = 'Microsoft.VCLibs.140.00_14.0.33519.0_x64__8wekyb3d8bbwe.appx'; Url = 'https://tlu.dl.delivery.mp.microsoft.com/filestreamingservice/files/x64' }
+    [pscustomobject]@{ FileName = 'Microsoft.VCLibs.140.00_99.0.0.0_arm64__8wekyb3d8bbwe.appx'; Url = 'https://tlu.dl.delivery.mp.microsoft.com/filestreamingservice/files/arm64' }
+    [pscustomobject]@{ FileName = 'Microsoft.VCLibs.140.00_14.0.30000.0_arm64__8wekyb3d8bbwe.appx'; Url = 'https://tlu.dl.delivery.mp.microsoft.com/filestreamingservice/files/old-arm64' }
+)
+$env:PROCESSOR_ARCHITECTURE = 'ARM64'
+Remove-Item Env:PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
+$armSelection = Resolve-DependencyPackage -Listing $archListing -DependencyIdentity 'Microsoft.VCLibs.140.00' -MinimumVersion '14.0.33519.0'
+Assert-Equal 'arm64 framework selected' 'arm64' $armSelection.Architecture
+Assert-Equal 'arm64 framework meets minimum' '99.0.0.0' $armSelection.Version
+$env:PROCESSOR_ARCHITECTURE = 'AMD64'
+$x64Selection = Resolve-DependencyPackage -Listing $archListing -DependencyIdentity 'Microsoft.VCLibs.140.00' -MinimumVersion '14.0.33519.0'
+Assert-Equal 'x64 host does not select arm64' 'x64' $x64Selection.Architecture
+$tooNew = $false
+try {
+    Resolve-DependencyPackage -Listing $archListing -DependencyIdentity 'Microsoft.VCLibs.140.00' -MinimumVersion '100.0.0.0' | Out-Null
+} catch {
+    $tooNew = $true
+}
+Write-Result -Name 'missing minimum version fails' -Condition $tooNew
+if ([string]::IsNullOrEmpty($savedArchitecture)) {
+    Remove-Item Env:PROCESSOR_ARCHITECTURE -ErrorAction SilentlyContinue
+} else {
+    $env:PROCESSOR_ARCHITECTURE = $savedArchitecture
+}
+
+Assert-Equal 'already installed disposition' 'present' (Get-DeploymentDisposition -Success $false -Code '0x80073CFB')
+Assert-Equal 'dependency disposition' 'dependency' (Get-DeploymentDisposition -Success $false -Code '0x80073CF3')
+Assert-Equal 'success disposition' 'installed' (Get-DeploymentDisposition -Success $true -Code $null)
+
+Write-Host ''
+Write-Host 'package inspection'
+
+Initialize-ZipSupport
+$fixtureDir = Join-Path ([IO.Path]::GetTempPath()) ('xbox-offline-update-tests-' + [guid]::NewGuid().ToString('n'))
+New-Item -ItemType Directory -Path $fixtureDir | Out-Null
+try {
+    $manifestXml = @"
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+  <Identity Name="Microsoft.NET.Native.Runtime.2.2" ProcessorArchitecture="x64" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" Version="2.2.28604.0" />
+</Package>
+"@
+    $packagePath = Join-Path $fixtureDir 'runtime.appx'
+    $package = [IO.Compression.ZipFile]::Open($packagePath, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $entry = $package.CreateEntry('AppxManifest.xml')
+        $entryStream = $entry.Open()
+        try {
+            $body = [Text.Encoding]::UTF8.GetBytes($manifestXml)
+            $bom = [byte[]](0xEF, 0xBB, 0xBF)
+            $entryStream.Write($bom, 0, $bom.Length)
+            $entryStream.Write($body, 0, $body.Length)
+        } finally {
+            $entryStream.Dispose()
+        }
+    } finally {
+        $package.Dispose()
+    }
+    $identity = Get-PackageIdentity -Path $packagePath
+    Assert-Equal 'namespaced manifest name' 'Microsoft.NET.Native.Runtime.2.2' $identity.Name
+    Assert-Equal 'namespaced manifest version' '2.2.28604.0' $identity.Version
+    Assert-Equal 'namespaced manifest architecture' 'x64' $identity.Architecture
+
+    $dtdXml = '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe "Microsoft.GamingServices">]><Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"><Identity Name="&xxe;" Version="1.0.0.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" /></Package>'
+    $dtdPath = Join-Path $fixtureDir 'dtd.appx'
+    $dtdPackage = [IO.Compression.ZipFile]::Open($dtdPath, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $dtdEntry = $dtdPackage.CreateEntry('AppxManifest.xml')
+        $dtdStream = $dtdEntry.Open()
+        try {
+            $dtdBytes = [Text.Encoding]::UTF8.GetBytes($dtdXml)
+            $dtdStream.Write($dtdBytes, 0, $dtdBytes.Length)
+        } finally {
+            $dtdStream.Dispose()
+        }
+    } finally {
+        $dtdPackage.Dispose()
+    }
+    $dtdProvenance = Test-PackageProvenance -Path $dtdPath -ExpectedIdentity 'Microsoft.GamingServices'
+    Write-Result -Name 'dtd manifest is rejected' -Condition (-not $dtdProvenance.Passed)
+    $dtdDetail = ($dtdProvenance.Checks | ForEach-Object { $_.Detail }) -join ' '
+    Write-Result -Name 'dtd entity is not accepted as the identity' -Condition ($dtdDetail -notlike '*Microsoft.GamingServices 1.0.0.0*')
+
+    $oversizedPath = Join-Path $fixtureDir 'large.appx'
+    $oversized = [IO.Compression.ZipFile]::Open($oversizedPath, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $largeEntry = $oversized.CreateEntry('AppxManifest.xml')
+        $largeStream = $largeEntry.Open()
+        try {
+            $block = New-Object byte[] 1048576
+            for ($i = 0; $i -lt 5; $i++) { $largeStream.Write($block, 0, $block.Length) }
+        } finally {
+            $largeStream.Dispose()
+        }
+    } finally {
+        $oversized.Dispose()
+    }
+    $oversizedRejected = $false
+    try {
+        Get-PackageIdentity -Path $oversizedPath | Out-Null
+    } catch {
+        $oversizedRejected = $_.Exception.Message -like '*exceeds the allowed size*'
+    }
+    Write-Result -Name 'oversized manifest is rejected' -Condition $oversizedRejected
+
+    $htmlPath = Join-Path $fixtureDir 'error.html'
+    [IO.File]::WriteAllText($htmlPath, ('<html>' + ('x' * 200000) + '</html>'))
+    $htmlError = Test-ZipPackageFile -Path $htmlPath
+    Write-Result -Name 'html payload is rejected' -Condition ($htmlError -like '*not a zip package*')
+
+    $smallZip = Join-Path $fixtureDir 'small.zip'
+    $smallArchive = [IO.Compression.ZipFile]::Open($smallZip, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $smallEntry = $smallArchive.CreateEntry('AppxManifest.xml', [IO.Compression.CompressionLevel]::NoCompression)
+        $smallStream = $smallEntry.Open()
+        try {
+            $padding = New-Object byte[] 40000
+            $smallStream.Write($padding, 0, $padding.Length)
+        } finally {
+            $smallStream.Dispose()
+        }
+    } finally {
+        $smallArchive.Dispose()
+    }
+    Write-Result -Name 'sub-megabyte zip is accepted' -Condition ($null -eq (Test-ZipPackageFile -Path $smallZip))
+
+    $cacheRoot = Join-Path $fixtureDir 'cache'
+    New-Item -ItemType Directory -Path $cacheRoot | Out-Null
+    $cached = Join-Path $cacheRoot 'cached.pkg'
+    $outside = Join-Path $fixtureDir 'keep.pkg'
+    [IO.File]::WriteAllText($cached, 'stale')
+    [IO.File]::WriteAllText($outside, 'keep')
+    Remove-CachedDownload -Path $cached -CacheDirectory $cacheRoot
+    Remove-CachedDownload -Path $outside -CacheDirectory $cacheRoot
+    Write-Result -Name 'failed cache file is removed' -Condition (-not (Test-Path -LiteralPath $cached))
+    Write-Result -Name 'file outside the cache is kept' -Condition (Test-Path -LiteralPath $outside)
+} finally {
+    if (Test-Path -LiteralPath $fixtureDir) { Remove-Item -LiteralPath $fixtureDir -Recurse -Force }
+}
+
+Write-Host ''
 Write-Host ('passed: ' + $script:Passed + '  failed: ' + $script:Failed)
 if ($script:Failed -gt 0) { exit 1 }
 exit 0

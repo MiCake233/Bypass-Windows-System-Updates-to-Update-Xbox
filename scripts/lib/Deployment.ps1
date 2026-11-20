@@ -10,7 +10,7 @@ $script:DeploymentGuidance = @{
     '0x80073CF3' = 'The package depends on a framework that is not installed. The updater resolves missing frameworks automatically; re-run with -Verbose to see the dependency it selected.'
     '0x80073D02' = 'The package is in use. Close the Xbox app, Microsoft Store and any running game, then re-run.'
     '0x80073D0A' = 'Another deployment is in progress. Wait for it to finish and re-run.'
-    '0x80073CFB' = 'The package is already installed with the same or a higher version. Nothing to do.'
+    '0x80073CFB' = 'This package is already installed, and Windows blocked installing it again. Nothing to do when that installed copy is the one you need.'
     '0x80073CF9' = 'The AppX deployment service rejected the package. Restart AppXSvc (or reboot) and re-run.'
     '0x80073CF6' = 'The package could not be registered. Remove the existing registration for this identity and re-run.'
     '0x80073D05' = 'The package is held open by a running process. Close all Xbox related processes and re-run.'
@@ -68,6 +68,19 @@ function Get-MissingDependency {
         Identity   = $identity
         MinVersion = $minVersion
     }
+}
+
+function Get-DeploymentDisposition {
+    param(
+        [bool]$Success,
+        [string]$Code
+    )
+    if ($Success) { return 'installed' }
+    # 0x80073CFB is ERROR_PACKAGE_ALREADY_EXISTS: the package is already registered
+    # and reinstallation was blocked. That satisfies the request for this version.
+    if ($Code -eq '0x80073CFB') { return 'present' }
+    if ($Code -eq '0x80073CF3') { return 'dependency' }
+    return 'failed'
 }
 
 function Get-DeploymentGuidance {

@@ -76,62 +76,6 @@ if ([string]::IsNullOrWhiteSpace($CacheRoot)) {
 }
 $script:DownloadDir = Join-Path $CacheRoot 'packages'
 
-function Get-HostArchitecture {
-    switch ($env:PROCESSOR_ARCHITECTURE) {
-        'ARM64' { return 'arm64' }
-        'AMD64' { return 'x64' }
-        default { return 'x64' }
-    }
-}
-
-function Save-PackageFile {
-    param(
-        [Parameter(Mandatory = $true)][string]$Url,
-        [Parameter(Mandatory = $true)][string]$Destination,
-        [int]$MaxAttempts = 3
-    )
-    $partial = $Destination + '.partial'
-    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-        try {
-            if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue }
-            $saved = $ProgressPreference
-            $ProgressPreference = 'SilentlyContinue'
-            try {
-                Invoke-WebRequest -Uri $Url -OutFile $partial -UseBasicParsing -TimeoutSec 1800
-            } finally {
-                $ProgressPreference = $saved
-            }
-            $length = (Get-Item -LiteralPath $partial).Length
-            if ($length -lt 1MB) { throw ('Downloaded file is too small (' + $length + ' bytes).') }
-            Move-Item -LiteralPath $partial -Destination $Destination -Force
-            Write-Log -Message ('Downloaded ' + (Split-Path -Leaf $Destination) + ' (' + [math]::Round($length / 1MB, 1) + ' MB)') -Level OK
-            return $true
-        } catch {
-            Write-Log -Message ('Download attempt ' + $attempt + '/' + $MaxAttempts + ' failed: ' + $_.Exception.Message) -Level WARN
-            if ($attempt -lt $MaxAttempts) { Start-Sleep -Seconds (3 * $attempt) }
-        }
-    }
-    return $false
-}
-
-function Get-TargetFromUrl {
-    param([Parameter(Mandatory = $true)][string]$Url)
-    $safe = Resolve-SafeDownloadUrl -Url $Url
-    if (-not $safe) { throw 'The supplied URL is not an https URL on a Microsoft delivery host.' }
-    $fileName = [IO.Path]::GetFileName(([Uri]$safe).AbsolutePath)
-    $parsed = ConvertFrom-StoreFileName -FileName $fileName
-    if ($null -eq $parsed) { throw ('Cannot parse the package identity from the file name: ' + $fileName) }
-    return [pscustomobject]@{
-        Identity     = $parsed.Identity
-        Version      = $parsed.Version
-        Architecture = $parsed.Architecture
-        Extension    = $parsed.Extension
-        FileName     = $fileName
-        Url          = $safe
-        LocalPath    = $null
-    }
-}
-
 function Get-TargetFromFile {
     param([Parameter(Mandatory = $true)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { throw ('File not found: ' + $Path) }
@@ -150,22 +94,6 @@ function Get-TargetFromFile {
     }
 }
 
-function Resolve-DependencyPackage {
-    param(
-        [string]$ProductId,
-        [object[]]$Listing,
-        [Parameter(Mandatory = $true)][string]$DependencyIdentity
-    )
-    if ($null -eq $Listing) {
-        $Listing = Get-StoreCatalogListing -ProductId $ProductId
-    }
-    $target = Select-CatalogPackage -Listing $Listing -Identity $DependencyIdentity -Architecture @('x64', 'neutral') -Extension @('appx', 'msix')
-    if ($null -eq $target) {
-        throw ('The catalog has no deployable payload for the required framework ' + $DependencyIdentity + '.')
-    }
-    return $target
-}
-
 function Get-PackagePath {
     param([Parameter(Mandatory = $true)]$Target)
     if ($Target.LocalPath) { return $Target.LocalPath }
@@ -178,7 +106,7 @@ function Get-PackagePath {
         return $destination
     }
     $ok = Save-PackageFile -Url $Target.Url -Destination $destination
-    if (-not $ok) { throw ('Download failed for ' + $Target.Url) }
+    if (-not $ok) { throw ('Download failed for ' + (Get-RedactedUrl -Url $Target.Url)) }
     return $destination
 }
 
@@ -196,6 +124,29 @@ function Test-TargetPackage {
     if (-not $provenance.Passed) {
         throw ('Provenance verification failed for ' + (Split-Path -Leaf $Path) + '. The package was not deployed.')
     }
+    return $provenance
+}
+
+function Import-VerifiedPackage {
+    param(
+        [Parameter(Mandatory = $true)]$Target,
+        [Parameter(Mandatory = $true)][string]$ExpectedIdentity,
+        [string]$InstalledVersion,
+        [string]$MinimumVersion,
+        [switch]$Force
+    )
+    $path = Get-PackagePath -Target $Target
+    try {
+        $provenance = Test-TargetPackage -Path $path -Identity $ExpectedIdentity
+        $decision = Test-PackageVersionPolicy -ManifestVersion $provenance.Identity.Version -AdvertisedVersion $Target.Version -InstalledVersion $InstalledVersion -MinimumVersion $MinimumVersion -ManifestArchitecture $provenance.Identity.Architecture -AdvertisedArchitecture $Target.Architecture -HostArchitecture (Get-HostArchitecture) -Force:$Force
+        if (-not $decision.Passed) { throw $decision.Reason }
+        return $path
+    } catch {
+        if ([string]::IsNullOrEmpty($Target.LocalPath)) {
+            Remove-CachedDownload -Path $path -CacheDirectory $script:DownloadDir
+        }
+        throw
+    }
 }
 
 function Install-TargetBundle {
@@ -210,20 +161,21 @@ function Install-TargetBundle {
     while ($attempt -lt 5) {
         $attempt++
         $result = Install-PackageFile -Path $Path -RestartGamingServices:$RestartServices
-        if ($result.Success) { return $true }
-        if ($result.Code -ne '0x80073CF3') { break }
+        $disposition = Get-DeploymentDisposition -Success $result.Success -Code $result.Code
+        if ($disposition -eq 'installed' -or $disposition -eq 'present') { return $true }
+        if ($disposition -ne 'dependency') { break }
 
         $dependency = Get-MissingDependency -Message $result.Message
         if ($null -eq $dependency) { break }
         if ($script:InstalledDependencies -contains $dependency.Identity) { break }
 
         Write-Log -Message ('Deployment requires framework ' + $dependency.Identity + ' ' + $dependency.MinVersion) -Level WARN
-        $dependencyTarget = Resolve-DependencyPackage -ProductId $ProductId -Listing $Listing -DependencyIdentity $dependency.Identity
+        $dependencyTarget = Resolve-DependencyPackage -ProductId $ProductId -Listing $Listing -DependencyIdentity $dependency.Identity -MinimumVersion $dependency.MinVersion
         Write-Log -Message ('Resolved framework ' + $dependencyTarget.Identity + ' ' + $dependencyTarget.Version) -Level STEP
-        $dependencyPath = Get-PackagePath -Target $dependencyTarget
-        Test-TargetPackage -Path $dependencyPath -Identity $dependencyTarget.Identity
+        $dependencyPath = Import-VerifiedPackage -Target $dependencyTarget -ExpectedIdentity $dependencyTarget.Identity -MinimumVersion $dependency.MinVersion
         $dependencyResult = Install-PackageFile -Path $dependencyPath
-        if (-not $dependencyResult.Success) {
+        $dependencyDisposition = Get-DeploymentDisposition -Success $dependencyResult.Success -Code $dependencyResult.Code
+        if ($dependencyDisposition -ne 'installed' -and $dependencyDisposition -ne 'present') {
             throw ('Framework deployment failed for ' + $dependencyTarget.FileName + ' (' + $dependencyResult.Code + '). ' + $dependencyResult.Guidance)
         }
         $script:InstalledDependencies += $dependency.Identity
@@ -257,9 +209,11 @@ function Invoke-PackageUpdate {
         $listing = $resolved.Listing
         $target = $resolved.Target
     }
-    Write-Log -Message ('Available: ' + $target.Version + ' (' + $target.FileName + ')') -Level INFO
+    $availableText = $target.FileName
+    if (-not [string]::IsNullOrEmpty($target.Version)) { $availableText = $target.Version + ' (' + $target.FileName + ')' }
+    Write-Log -Message ('Available: ' + $availableText) -Level INFO
 
-    if (-not $Force -and -not [string]::IsNullOrEmpty($installed)) {
+    if (-not $Force -and -not [string]::IsNullOrEmpty($installed) -and -not [string]::IsNullOrEmpty($target.Version)) {
         if ((Compare-PackageVersion -Left $target.Version -Right $installed) -le 0) {
             Write-Log -Message ('No action required: installed version is current.') -Level OK
             return [pscustomobject]@{ Label = $Label; Status = 'current'; From = $installed; To = $installed }
@@ -271,15 +225,18 @@ function Invoke-PackageUpdate {
         return [pscustomobject]@{ Label = $Label; Status = 'planned'; From = $installedText; To = $target.Version }
     }
 
-    $path = Get-PackagePath -Target $target
-    Test-TargetPackage -Path $path -Identity $Identity
-    $deployed = Install-TargetBundle -Path $path -ProductId $ProductId -Listing $listing -RestartServices:$StopServices
+    $path = Import-VerifiedPackage -Target $target -ExpectedIdentity $Identity -InstalledVersion $installed -Force:$Force
+    Install-TargetBundle -Path $path -ProductId $ProductId -Listing $listing -RestartServices:$StopServices | Out-Null
 
     $after = Get-InstalledPackageVersion -Identity $Identity
     $afterText = 'not installed'
     if (-not [string]::IsNullOrEmpty($after)) { $afterText = $after }
+    $status = 'updated'
+    if (-not [string]::IsNullOrEmpty($installed) -and -not [string]::IsNullOrEmpty($after) -and (Compare-PackageVersion -Left $after -Right $installed) -le 0) {
+        $status = 'current'
+    }
     Write-Log -Message ('Installed now: ' + $afterText) -Level OK
-    return [pscustomobject]@{ Label = $Label; Status = 'updated'; From = $installedText; To = $afterText }
+    return [pscustomobject]@{ Label = $Label; Status = $status; From = $installedText; To = $afterText }
 }
 
 # ---------------------------------------------------------------- main
@@ -311,9 +268,10 @@ try {
         $results += Invoke-PackageUpdate -Label 'Xbox app' -ProductId $XboxAppProductId -Identity $XboxAppIdentity -LocalBundle $XboxAppBundle -DirectUrl $XboxAppUrl
     }
 } catch {
+    $failure = Get-RedactedLogText -Message $_.Exception.Message
     $exitCode = 1
-    Write-Log -Message ('Failed: ' + $_.Exception.Message) -Level ERROR
-    if ($_.Exception.Message -like '*Deployment failed*') { $exitCode = 6 }
+    Write-Log -Message ('Failed: ' + $failure) -Level ERROR
+    if ($failure -like '*Deployment failed*') { $exitCode = 6 }
 }
 
 Write-Log -Message '--- summary ---' -Level STEP

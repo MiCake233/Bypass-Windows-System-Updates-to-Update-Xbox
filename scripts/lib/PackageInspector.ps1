@@ -5,6 +5,10 @@
 # the publisher identity encoded in the package family name; a package that is not signed
 # by Microsoft Corporation cannot be registered for these identities.
 
+# Manifests and signature blocks are small. A larger entry is rejected so a hostile
+# archive cannot expand without bound while it is being inspected.
+$script:MaxZipEntryBytes = 4MB
+
 function Initialize-ZipSupport {
     if (-not ('System.IO.Compression.ZipFile' -as [type])) {
         Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
@@ -18,13 +22,72 @@ function Get-ZipEntryBytes {
     )
     $entry = $Archive.GetEntry($EntryName)
     if ($null -eq $entry) { return $null }
+    if ($entry.Length -gt $script:MaxZipEntryBytes) {
+        throw ('Zip entry ' + $EntryName + ' exceeds the allowed size.')
+    }
     $stream = $entry.Open()
+    $buffer = $null
     try {
         $buffer = New-Object System.IO.MemoryStream
-        $stream.CopyTo($buffer)
+        $chunk = New-Object byte[] 8192
+        $total = 0
+        while (($read = $stream.Read($chunk, 0, $chunk.Length)) -gt 0) {
+            $total += $read
+            if ($total -gt $script:MaxZipEntryBytes) {
+                throw ('Zip entry ' + $EntryName + ' exceeds the allowed size.')
+            }
+            $buffer.Write($chunk, 0, $read)
+        }
         return , $buffer.ToArray()
     } finally {
+        if ($null -ne $buffer) { $buffer.Dispose() }
         $stream.Dispose()
+    }
+}
+
+# Real Store packages are often far smaller than 1 MB (VCLibs and .NET Native
+# Runtime are hundreds of kilobytes). The floor only rejects empty responses;
+# the zip header rejects HTML error pages of any size.
+function Test-ZipPackageFile {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $item = Get-Item -LiteralPath $Path
+    if ($item.Length -lt 32KB) {
+        return ('Downloaded file is too small (' + $item.Length + ' bytes).')
+    }
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $header = New-Object byte[] 4
+        $read = $stream.Read($header, 0, 4)
+    } finally {
+        $stream.Dispose()
+    }
+    if ($read -lt 4 -or $header[0] -ne 0x50 -or $header[1] -ne 0x4B -or $header[2] -ne 0x03 -or $header[3] -ne 0x04) {
+        return 'Downloaded file is not a zip package.'
+    }
+    return $null
+}
+
+function Read-PackageManifestXml {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+    if (-not [string]::IsNullOrEmpty($Text) -and [int][char]$Text[0] -eq 0xFEFF) {
+        $Text = $Text.Substring(1)
+    }
+    $settings = New-Object System.Xml.XmlReaderSettings
+    $settings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+    $settings.XmlResolver = $null
+    $settings.MaxCharactersInDocument = $script:MaxZipEntryBytes
+    $stringReader = $null
+    $reader = $null
+    try {
+        $stringReader = New-Object System.IO.StringReader $Text
+        $reader = [System.Xml.XmlReader]::Create($stringReader, $settings)
+        $xml = New-Object System.Xml.XmlDocument
+        $xml.XmlResolver = $null
+        $xml.Load($reader)
+        return $xml
+    } finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        if ($null -ne $stringReader) { $stringReader.Dispose() }
     }
 }
 
@@ -42,22 +105,30 @@ function Get-PackageIdentity {
         }
         $bytes = Get-ZipEntryBytes -Archive $archive -EntryName $entryName
         $text = [Text.Encoding]::UTF8.GetString($bytes)
-        $xml = New-Object System.Xml.XmlDocument
-        $xml.LoadXml($text)
+        $xml = Read-PackageManifestXml -Text $text
+        # Store manifests declare a default namespace. XPath without a namespace
+        # manager does not see those elements, so match on LocalName instead.
+        $rootName = $null
+        if ($null -ne $xml.DocumentElement) { $rootName = $xml.DocumentElement.LocalName }
+        if ($rootName -ne 'Bundle' -and $rootName -ne 'Package') {
+            throw 'Package manifest root is not Bundle or Package.'
+        }
         $identityNode = $null
-        if ($null -ne $xml.DocumentElement -and $xml.DocumentElement.Name -eq 'Bundle') {
-            $identityNode = $xml.DocumentElement.SelectSingleNode('Identity')
-        } elseif ($null -ne $xml.DocumentElement -and $xml.DocumentElement.Name -eq 'Package') {
-            $identityNode = $xml.DocumentElement.SelectSingleNode('Identity')
+        foreach ($child in $xml.DocumentElement.ChildNodes) {
+            if ($child.NodeType -eq [System.Xml.XmlNodeType]::Element -and $child.LocalName -eq 'Identity') {
+                $identityNode = $child
+                break
+            }
         }
         if ($null -eq $identityNode) {
             throw 'Identity element missing from ' + $entryName + '.'
         }
         return [pscustomobject]@{
-            Name        = [string]$identityNode.GetAttribute('Name')
-            Version     = [string]$identityNode.GetAttribute('Version')
-            Publisher   = [string]$identityNode.GetAttribute('Publisher')
-            Manifest    = $entryName
+            Name         = [string]$identityNode.GetAttribute('Name')
+            Version      = [string]$identityNode.GetAttribute('Version')
+            Publisher    = [string]$identityNode.GetAttribute('Publisher')
+            Architecture = [string]$identityNode.GetAttribute('ProcessorArchitecture')
+            Manifest     = $entryName
         }
     } finally {
         $archive.Dispose()

@@ -52,10 +52,14 @@ enforce certificate lifetime.
 
 ## Deployment sequence
 
-1. `Invoke-XboxOfflineUpdate.ps1` resolves the newest payload whose identity and architecture match.
+1. `Invoke-XboxOfflineUpdate.ps1` resolves the newest payload whose identity matches and whose
+   architecture is neutral or the architecture of this PC.
 2. The bundle is downloaded and inspected: manifest identity, manifest publisher, signature block.
+   The manifest version has to match the selected file name. A file name that claims a newer build
+   than the manifest is rejected, so the catalog cannot point a new name at an older package.
 3. The installed version is read with `Get-AppxPackage`. When it is equal or newer, the package is
-   skipped unless `-Force` is supplied.
+   skipped unless `-Force` is supplied. The same comparison is repeated against the manifest version
+   before deployment.
 4. `Add-AppxPackage -Path <bundle> -ForceApplicationShutdown` hands the file to the deployment
    service.
 5. The deployment service validates the signature, stages the directory under
@@ -83,8 +87,8 @@ framework and its minimum version. The updater resolves that identity from the s
 applies the same provenance checks, installs it, and retries. Frameworks are never downloaded from
 a source that is not the resolved catalog for the same product.
 
-Resolution order for frameworks is `x64` then `neutral`, matching the architecture of the inner
-application package.
+Frameworks are selected for this PC's architecture (`x64`, `arm64`, `arm`, or `x86`) and then
+`neutral`. A package built for a different architecture is not downloaded.
 
 ## Version numbering
 

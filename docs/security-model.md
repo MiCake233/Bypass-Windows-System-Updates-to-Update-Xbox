@@ -38,7 +38,9 @@ adding assurance.
 
 A signed URL issued by the Microsoft delivery service is bound to the requested path. A modified
 catalog response cannot redirect the download to a non-Microsoft host, because the host allow list
-is applied to the response rather than trusted from it.
+is applied to the response and again to the final URL after any HTTP redirect. The version used to
+decide whether a package is newer than the one installed is the version in the package manifest,
+and it has to match the file name that was selected. The file name alone is not trusted.
 
 ## Third-party component
 
@@ -51,10 +53,11 @@ Microsoft's product and delivery APIs. Its output is treated as untrusted input:
 - the artifact must pass the signature block check.
 
 The realistic worst case for a compromised resolver is therefore a *valid Microsoft package for the
-same identity at a different version*, for example an older one. Version comparison and the
-`-Force` semantics bound that: without `-Force`, a package older than the installed one is not
-installed. A resolver cannot deliver arbitrary code, because arbitrary code cannot be signed as
-`Microsoft.GamingServices_8wekyb3d8bbwe`.
+same identity at a different version*, for example an older one. The manifest version, not the
+catalog file name, is compared with the installed version: without `-Force`, a package whose
+manifest is older than or equal to the installed one is not installed, and a manifest version that
+disagrees with the file name is rejected. A resolver cannot deliver arbitrary code, because
+arbitrary code cannot be signed as `Microsoft.GamingServices_8wekyb3d8bbwe`.
 
 Users who want to remove the dependency entirely can pass `-GamingServicesBundle` /
 `-XboxAppBundle` with a bundle they obtained and verified themselves, or `-GamingServicesUrl` with
