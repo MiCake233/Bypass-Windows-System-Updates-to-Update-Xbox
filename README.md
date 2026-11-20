@@ -164,6 +164,8 @@ docs\security-model.md              trust anchors, threat model, limitations
 docs\troubleshooting.md             error codes and remedies
 ```
 
+Run the offline test suite with `.\tests\Run-Tests.ps1`.
+
 ## Disclaimer
 
 Not affiliated with Microsoft. The updater installs unmodified Microsoft packages; it does not
